@@ -11,7 +11,13 @@ services:
         value: production
       - key: UPSTOX_ACCESS_TOKEN
         sync: false
+      - key: UPSTOX_REFRESH_TOKEN
+        sync: false
       - key: UPSTOX_API_KEY
         sync: false
       - key: UPSTOX_API_SECRET
+        sync: false
+      - key: TOKEN_ADMIN_KEY
+        sync: false
+      - key: ALERT_WEBHOOK_URL
         sync: false
