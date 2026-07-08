@@ -34,7 +34,6 @@ const crypto = require('crypto');
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env.PORT || '4000', 10);
-const UPSTOX_ACCESS_TOKEN = process.env.UPSTOX_ACCESS_TOKEN || '';
 const UPSTOX_API_KEY = process.env.UPSTOX_API_KEY || '';
 const UPSTOX_API_SECRET = process.env.UPSTOX_API_SECRET || '';
 const UPSTOX_WS_URL = 'wss://api.upstox.com/v2/feed/market-data-feed';
@@ -44,6 +43,11 @@ const MARKET_POLL_INTERVAL_MS = 1500; // Yahoo Finance poll interval
 const DERIVED_BROADCAST_INTERVAL_MS = 3000; // Derived data broadcast interval
 const CLIENT_PING_INTERVAL_MS = 30000; // Ping clients every 30s
 const CLIENT_PONG_TIMEOUT_MS = 10000; // Disconnect if no pong in 10s
+
+// ─── Token Management Config ───────────────────────────────────────────────
+const TOKEN_ADMIN_KEY = process.env.TOKEN_ADMIN_KEY || 'pepertect-admin-2024';
+const TOKEN_CHECK_INTERVAL_MS = 30 * 60 * 1000;  // Check token every 30 min
+const TOKEN_REFRESH_BEFORE_EXPIRY_MS = 30 * 60 * 1000; // Refresh 30 min before expiry
 
 // ─── Symbol Mappings ────────────────────────────────────────────────────────
 
@@ -183,11 +187,279 @@ const state = {
   yahooIndexBatch: [],
   yahooStockBatches: [],
 
-  // Option chain polling
-  optionChainTimers: new Map(), // clientId → timer
+  // Option chain — global shared polling (1s)
+  ocSubscriptions: new Map(),   // key ("NIFTY::2026-07-14") → Set<clientId>
+  ocPollTimers: new Map(),     // key → timer
+  ocLatestData: new Map(),     // key → last fetched data
+  ocFetchInProgress: new Set(), // dedup in-flight fetches per key
+
+  // Positions polling (per-client)
+  positionTimers: new Map(),   // clientId → timer
 };
 
 let clientCounter = 0;
+
+// ─── Token Management State ───────────────────────────────────────────────
+const tokenState = {
+  accessToken: process.env.UPSTOX_ACCESS_TOKEN || '',
+  refreshToken: process.env.UPSTOX_REFRESH_TOKEN || '',
+  tokenValid: false,
+  tokenCheckedAt: null,
+  estimatedExpiry: null,   // Timestamp when token likely expires (~24h from issue)
+  lastRefreshAttempt: 0,
+  refreshFailCount: 0,
+  totalRefreshes: 0,
+  lastManualUpdate: null,
+  usingFallback: false,    // True when token is invalid, Yahoo is primary
+  tokenCheckTimer: null,
+  alertCooldown: 0,        // Prevent alert spam
+};
+
+// ─── Token Management Functions ───────────────────────────────────────────
+
+/** Validate current access token by calling Upstox profile API */
+async function validateToken() {
+  if (!tokenState.accessToken) {
+    console.log('[Token] No access token configured — using Yahoo Finance fallback');
+    tokenState.tokenValid = false;
+    tokenState.usingFallback = true;
+    return false;
+  }
+
+  try {
+    const res = await fetch(`${UPSTOX_REST_URL}/user/profile`, {
+      headers: {
+        Authorization: `Bearer ${tokenState.accessToken}`,
+        Accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (res.ok) {
+      tokenState.tokenValid = true;
+      tokenState.usingFallback = false;
+      tokenState.tokenCheckedAt = Date.now();
+      // Upstox tokens last ~24h; estimate expiry from first validation
+      if (!tokenState.estimatedExpiry) {
+        tokenState.estimatedExpiry = Date.now() + 24 * 60 * 60 * 1000;
+      }
+      console.log('[Token] Access token is VALID');
+      return true;
+    }
+
+    if (res.status === 401 || res.status === 403) {
+      console.log('[Token] Access token EXPIRED/INVALID — attempting refresh...');
+      tokenState.tokenValid = false;
+      return await attemptTokenRefresh();
+    }
+
+    console.warn(`[Token] Profile check returned ${res.status}`);
+    return false;
+  } catch (err) {
+    console.error('[Token] Validation error:', err.message);
+    return false;
+  }
+}
+
+/** Attempt to refresh the access token using refresh_token */
+async function attemptTokenRefresh() {
+  if (!tokenState.refreshToken) {
+    console.log('[Token] No refresh_token available — manual update required');
+    tokenState.usingFallback = true;
+    sendTokenAlert('NO_REFRESH_TOKEN', 'No refresh token configured. Manual token update required.');
+    return false;
+  }
+
+  if (!UPSTOX_API_KEY || !UPSTOX_API_SECRET) {
+    console.log('[Token] No API key/secret — cannot auto-refresh');
+    tokenState.usingFallback = true;
+    sendTokenAlert('NO_CREDENTIALS', 'Upstox API key/secret not configured.');
+    return false;
+  }
+
+  // Rate limit refresh attempts (max 1 per minute)
+  const now = Date.now();
+  if (now - tokenState.lastRefreshAttempt < 60 * 1000) {
+    console.log('[Token] Refresh rate limited — too soon after last attempt');
+    return false;
+  }
+  tokenState.lastRefreshAttempt = now;
+
+  try {
+    const res = await fetch(`${UPSTOX_REST_URL}/login/authorization/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: tokenState.refreshToken,
+        client_id: UPSTOX_API_KEY,
+        client_secret: UPSTOX_API_SECRET,
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      tokenState.refreshFailCount++;
+      console.error(`[Token] Refresh FAILED (attempt ${tokenState.refreshFailCount}): ${res.status} ${errBody}`);
+
+      if (tokenState.refreshFailCount >= 3) {
+        tokenState.usingFallback = true;
+        sendTokenAlert('REFRESH_FAILED_3X', `Token refresh failed ${tokenState.refreshFailCount} times. Fallback to Yahoo active.`);
+      }
+      return false;
+    }
+
+    const json = await res.json();
+    if (!json.access_token) {
+      console.error('[Token] Refresh response missing access_token');
+      tokenState.refreshFailCount++;
+      return false;
+    }
+
+    // Success — update token state
+    tokenState.accessToken = json.access_token;
+    if (json.refresh_token) {
+      tokenState.refreshToken = json.refresh_token;
+    }
+    tokenState.tokenValid = true;
+    tokenState.usingFallback = false;
+    tokenState.refreshFailCount = 0;
+    tokenState.tokenCheckedAt = Date.now();
+    tokenState.estimatedExpiry = Date.now() + 24 * 60 * 60 * 1000;
+    tokenState.totalRefreshes++;
+
+    console.log(`[Token] Refresh SUCCESSFUL (refresh #${tokenState.totalRefreshes})`);
+
+    // Reconnect Upstox WS with new token
+    if (state.upstoxWs) {
+      console.log('[Token] Reconnecting Upstox WS with new token...');
+      state.upstoxWs.close();
+    }
+    connectUpstoxWS();
+
+    // Notify connected clients about token refresh
+    broadcastToChannel('market', {
+      type: 'system:token_refreshed',
+      data: { message: 'Upstox token refreshed successfully', timestamp: Date.now() },
+    });
+
+    return true;
+  } catch (err) {
+    console.error('[Token] Refresh exception:', err.message);
+    tokenState.refreshFailCount++;
+    return false;
+  }
+}
+
+/** Manually update the access token (called via admin API) */
+function updateAccessTokenManually(newToken, newRefreshToken) {
+  const oldToken = tokenState.accessToken;
+  tokenState.accessToken = newToken || '';
+  if (newRefreshToken) {
+    tokenState.refreshToken = newRefreshToken;
+  }
+  tokenState.lastManualUpdate = Date.now();
+  tokenState.refreshFailCount = 0;
+  tokenState.tokenCheckedAt = null;
+  tokenState.estimatedExpiry = null;
+  tokenState.alertCooldown = 0;
+
+  console.log(`[Token] Manual update: token ${oldToken ? 'changed' : 'set'} at ${new Date().toISOString()}`);
+
+  // Validate the new token
+  validateToken().then(valid => {
+    if (valid && state.upstoxConnected === false) {
+      console.log('[Token] New token valid — connecting Upstox WS...');
+      connectUpstoxWS();
+    }
+  });
+
+  return true;
+}
+
+/** Get token health info for /health endpoint */
+function getTokenHealth() {
+  const now = Date.now();
+  let expiresIn = 'unknown';
+  if (tokenState.estimatedExpiry) {
+    const remaining = tokenState.estimatedExpiry - now;
+    if (remaining > 0) {
+      const hours = Math.floor(remaining / 3600000);
+      const mins = Math.floor((remaining % 3600000) / 60000);
+      expiresIn = `${hours}h ${mins}m`;
+    } else {
+      expiresIn = 'expired';
+    }
+  }
+
+  return {
+    valid: tokenState.tokenValid,
+    configured: !!tokenState.accessToken,
+    hasRefreshToken: !!tokenState.refreshToken,
+    expiresIn,
+    usingFallback: tokenState.usingFallback,
+    totalRefreshes: tokenState.totalRefreshes,
+    refreshFailCount: tokenState.refreshFailCount,
+    lastChecked: tokenState.tokenCheckedAt,
+    lastManualUpdate: tokenState.lastManualUpdate,
+  };
+}
+
+/** Send alert webhook (Discord/Slack) for critical token events */
+async function sendTokenAlert(code, message) {
+  const webhookUrl = process.env.ALERT_WEBHOOK_URL;
+  if (!webhookUrl) {
+    console.log(`[Alert] ${code}: ${message} (no webhook configured)`);
+    return;
+  }
+
+  // Cooldown: max 1 alert per 30 minutes
+  const now = Date.now();
+  if (now - tokenState.alertCooldown < 30 * 60 * 1000) return;
+  tokenState.alertCooldown = now;
+
+  try {
+    await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: `⚠️ **Pepertect Token Alert** [${code}]\n${message}\nServer: ${process.env.RENDER_SERVICE_NAME || 'local'}\nTime: ${new Date().toISOString()}`,
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (err) {
+    console.error('[Alert] Webhook send failed:', err.message);
+  }
+}
+
+/** Periodic token health check — refreshes proactively before expiry */
+function startTokenCheckScheduler() {
+  if (tokenState.tokenCheckTimer) clearInterval(tokenState.tokenCheckTimer);
+
+  tokenState.tokenCheckTimer = setInterval(async () => {
+    // If no token at all, skip
+    if (!tokenState.accessToken) return;
+
+    // If token is already invalid and no refresh_token, skip
+    if (!tokenState.tokenValid && !tokenState.refreshToken) return;
+
+    // Check if token is about to expire
+    if (tokenState.estimatedExpiry) {
+      const remaining = tokenState.estimatedExpiry - Date.now();
+      if (remaining < TOKEN_REFRESH_BEFORE_EXPIRY_MS) {
+        console.log(`[Token] Token expiring in ${Math.round(remaining / 60000)}min — proactively refreshing...`);
+        await attemptTokenRefresh();
+        return;
+      }
+    }
+
+    // Periodic validation (every few hours)
+    await validateToken();
+  }, TOKEN_CHECK_INTERVAL_MS);
+
+  console.log(`[Token] Health check scheduler started (every ${TOKEN_CHECK_INTERVAL_MS / 60000}min)`);
+}
 
 // ─── Utility Functions ──────────────────────────────────────────────────────
 
@@ -459,6 +731,7 @@ function broadcastMarketUpdate() {
     stocks: { ...state.stocks },
     timestamp: Date.now(),
     source: state.activeSource,
+    dataLabel: tokenState.usingFallback ? 'DELAYED' : 'REAL-TIME',
   };
 
   broadcastToChannel('market', { type: 'market:update', data });
@@ -480,8 +753,9 @@ function broadcastDerivedData() {
 // ─── Upstox WebSocket (Binary Protocol) ─────────────────────────────────────
 
 function connectUpstoxWS() {
-  if (!UPSTOX_ACCESS_TOKEN) {
-    console.log('[UpstoxWS] No access token configured — using Yahoo Finance only');
+  if (!tokenState.accessToken || !tokenState.tokenValid) {
+    console.log('[UpstoxWS] No valid access token — using Yahoo Finance only');
+    tokenState.usingFallback = true;
     return;
   }
 
@@ -496,7 +770,7 @@ function connectUpstoxWS() {
       state.upstoxReconnectAttempt = 0;
 
       // Auth
-      ws.send(JSON.stringify({ Authorization: `Bearer ${UPSTOX_ACCESS_TOKEN}` }));
+      ws.send(JSON.stringify({ Authorization: `Bearer ${tokenState.accessToken}` }));
 
       // Subscribe to default instruments
       subscribeUpstoxInstruments(getDefaultUpstoxInstruments());
@@ -673,36 +947,71 @@ function stopUpstoxHeartbeat() {
   }
 }
 
-// ─── Option Chain Proxy (Upstox REST) ──────────────────────────────────────
+// ─── Option Chain — Global Shared Polling (1s) ────────────────────────────
+// All 4 indices: NIFTY, BANKNIFTY, FINNIFTY, SENSEX
+// One poll per key regardless of how many clients are subscribed.
+// Broadcasts to all subscribed clients.
+
+const OC_INSTRUMENT_KEYS = {
+  NIFTY: 'NSE_INDEX|Nifty 50',
+  BANKNIFTY: 'NSE_INDEX|Nifty Bank',
+  FINNIFTY: 'NSE_INDEX|Nifty Fin Service',
+  SENSEX: 'BSE_INDEX|SENSEX',
+};
+
+const OC_POLL_INTERVAL_MS = 1000; // 1 second — real-time feel
+
+function ocKey(underlying, expiry) {
+  return `${(underlying || '').toUpperCase()}::${expiry || ''}`;
+}
 
 async function fetchOptionChain(underlying, expiry) {
-  if (!UPSTOX_ACCESS_TOKEN) return null;
+  if (!tokenState.accessToken || !tokenState.tokenValid) {
+    // Option chain requires valid Upstox token — can't fallback to Yahoo
+    return null;
+  }
+
+  const instrumentKey = OC_INSTRUMENT_KEYS[underlying.toUpperCase()]
+    || UPSTOX_INDICES[underlying.toUpperCase()]
+    || `NSE_INDEX|${underlying}`;
 
   try {
-    let url = `${UPSTOX_REST_URL}/option/chain?instrument_key=NSE_INDEX|${underlying}`;
+    let url = `${UPSTOX_REST_URL}/option/chain?instrument_key=${encodeURIComponent(instrumentKey)}`;
     if (expiry) url += `&expiry_date=${encodeURIComponent(expiry)}`;
 
     const res = await fetch(url, {
       headers: {
-        Authorization: `Bearer ${UPSTOX_ACCESS_TOKEN}`,
+        Authorization: `Bearer ${tokenState.accessToken}`,
         Accept: 'application/json',
       },
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(5000),
     });
+
+    if (res.status === 401 || res.status === 403) {
+      // Token expired mid-session — mark invalid and attempt refresh
+      console.warn('[OC] Token expired during fetch — triggering refresh');
+      tokenState.tokenValid = false;
+      attemptTokenRefresh();
+      return null;
+    }
 
     if (!res.ok) return null;
     const json = await res.json();
     return json.data || null;
   } catch (err) {
-    console.error('[OptionChain] Fetch error:', err);
+    console.error('[OC] Fetch error for', underlying, expiry, err.message);
     return null;
   }
 }
 
-async function pollOptionChainForClient(clientId, underlying, expiry) {
-  const data = await fetchOptionChain(underlying, expiry);
-  if (data) {
-    // Extract relevant data from Upstox response and send to client
+async function fetchAndBroadcastOC(key, underlying, expiry) {
+  if (state.ocFetchInProgress.has(key)) return;
+  state.ocFetchInProgress.add(key);
+
+  try {
+    const data = await fetchOptionChain(underlying, expiry);
+    if (!data) return;
+
     const spotPrice = data.underlying_value || 0;
     const strikes = (data.option_chain_data || []).map(s => ({
       strike_price: s.strike_price,
@@ -724,41 +1033,111 @@ async function pollOptionChainForClient(clientId, underlying, expiry) {
           close_price: s.put_options?.market_data?.close || 0,
           volume: s.put_options?.market_data?.volume_traded || 0,
           oi: s.put_options?.market_data?.open_interest || 0,
-          prev_oi: s.put_options?.market_data?.previous_day_open_interest || 0,
-          bid_price: s.put_options?.market_data?.bid_price || 0,
-          ask_price: s.put_options?.market_data?.ask_price || 0,
+          prev_oi: s.call_options?.market_data?.previous_day_open_interest || 0,
+          bid_price: s.call_options?.market_data?.bid_price || 0,
+          ask_price: s.call_options?.market_data?.ask_price || 0,
         },
         option_greeks: s.put_options?.option_greeks || {},
       },
     }));
 
+    const totalCallOI = strikes.reduce((s, c) => s + (c.call_options?.market_data?.oi || 0), 0);
+    const totalPutOI = strikes.reduce((s, c) => s + (c.put_options?.market_data?.oi || 0), 0);
+
     const update = {
-      underlying,
+      underlying: (underlying || '').toUpperCase(),
       expiry: data.expiry_date || expiry || '',
       spot: spotPrice,
-      pcr: data.pcr || 0,
-      maxPainStrike: 0, // Compute if available
+      pcr: totalPutOI > 0 ? parseFloat((totalPutOI / totalCallOI).toFixed(2)) : 0,
+      totalCallOI,
+      totalPutOI,
+      maxPainStrike: 0,
       strikes,
       timestamp: Date.now(),
     };
 
-    sendToClient(clientId, { type: 'options:update', data: update });
+    // Cache for new subscribers
+    state.ocLatestData.set(key, update);
+
+    // Broadcast to ALL subscribed clients
+    const subs = state.ocSubscriptions.get(key);
+    if (subs && subs.size > 0) {
+      const msg = JSON.stringify({ type: 'options:update', data: update });
+      for (const cid of subs) {
+        const client = state.clients.get(cid);
+        if (client?.ws?.readyState === WebSocket.OPEN) {
+          try { client.ws.send(msg); } catch {}
+        }
+      }
+    }
+  } finally {
+    state.ocFetchInProgress.delete(key);
+  }
+}
+
+function startOCPolling(underlying, expiry) {
+  const key = ocKey(underlying, expiry);
+  if (state.ocPollTimers.has(key)) return;
+
+  console.log(`[OC] Starting 1s poll for ${key}`);
+
+  // Immediate first fetch
+  fetchAndBroadcastOC(key, underlying, expiry);
+
+  // Then every 1 second
+  const timer = setInterval(() => {
+    const subs = state.ocSubscriptions.get(key);
+    if (!subs || subs.size === 0) {
+      clearInterval(timer);
+      state.ocPollTimers.delete(key);
+      return;
+    }
+    fetchAndBroadcastOC(key, underlying, expiry);
+  }, OC_POLL_INTERVAL_MS);
+
+  state.ocPollTimers.set(key, timer);
+}
+
+function stopOCPolling(key) {
+  const timer = state.ocPollTimers.get(key);
+  if (timer) {
+    clearInterval(timer);
+    state.ocPollTimers.delete(key);
+  }
+  state.ocSubscriptions.delete(key);
+  // Keep ocLatestData — useful if someone re-subscribes quickly
+}
+
+/** Remove a client from ALL option chain subscriptions */
+function removeClientFromAllOC(clientId) {
+  for (const [key, subs] of state.ocSubscriptions) {
+    subs.delete(clientId);
+    if (subs.size === 0) {
+      stopOCPolling(key);
+    }
   }
 }
 
 // ─── Positions Proxy (Upstox REST) ─────────────────────────────────────────
 
 async function fetchPositions() {
-  if (!UPSTOX_ACCESS_TOKEN) return [];
+  if (!tokenState.accessToken || !tokenState.tokenValid) return [];
 
   try {
     const res = await fetch(`${UPSTOX_REST_URL}/portfolio/positions`, {
       headers: {
-        Authorization: `Bearer ${UPSTOX_ACCESS_TOKEN}`,
+        Authorization: `Bearer ${tokenState.accessToken}`,
         Accept: 'application/json',
       },
       signal: AbortSignal.timeout(10000),
     });
+
+    if (res.status === 401 || res.status === 403) {
+      console.warn('[Positions] Token expired — triggering refresh');
+      tokenState.tokenValid = false;
+      attemptTokenRefresh();
+      return [];
+    }
 
     if (!res.ok) return [];
     const json = await res.json();
@@ -768,22 +1147,65 @@ async function fetchPositions() {
   }
 }
 
+// ─── Rate Limiter (simple in-memory) ───────────────────────────────────────
+const rateLimitMap = new Map(); // ip → { count, resetAt }
+const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 60; // per IP per minute for REST
+const RATE_LIMIT_MAX_TOKEN_UPDATES = 5; // per IP per hour for token updates
+
+function checkRateLimit(ip, maxReqs, windowMs) {
+  const now = Date.now();
+  const key = `${ip}:${windowMs}`;
+  let entry = rateLimitMap.get(key);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + windowMs };
+    rateLimitMap.set(key, entry);
+  }
+  entry.count++;
+  return entry.count <= maxReqs;
+}
+
+// Cleanup rate limit entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitMap) {
+    if (now > entry.resetAt) rateLimitMap.delete(key);
+  }
+}, 60000);
+
+// ─── Allowed CORS Origins ─────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  'https://pepertect-v4.netlify.app',
+  'http://localhost:3000',
+  'http://localhost:3001',
+];
+
 // ─── HTTP Server ────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
-  // CORS headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  // CORS headers — restricted to known origins
+  const origin = req.headers.origin || '';
+  const allowedOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+  res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Admin-Key');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     return res.end();
   }
 
+  // Rate limiting for REST endpoints
+  const clientIP = req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(clientIP, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_MS)) {
+    res.writeHead(429, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Rate limit exceeded' }));
+    return;
+  }
+
   const url = new URL(req.url, `http://${req.headers.host}`);
 
-  // Health check — for UptimeRobot
+  // Health check — comprehensive for UptimeRobot + admin
   if (url.pathname === '/health') {
     const upstoxStatus = state.upstoxConnected ? 'connected' : 'disconnected';
     const clientCount = state.clients.size;
@@ -791,11 +1213,17 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
-      uptime: process.uptime(),
+      uptime: Math.round(process.uptime()),
       clients: clientCount,
       upstoxWs: upstoxStatus,
       yahooFinance: yahooStatus,
       activeSource: state.activeSource,
+      dataLabel: tokenState.usingFallback ? 'DELAYED' : 'REAL-TIME',
+      token: getTokenHealth(),
+      ocActivePolls: state.ocPollTimers.size,
+      ocSubscriptions: Object.fromEntries(
+        [...state.ocSubscriptions.entries()].map(([k, v]) => [k, v.size])
+      ),
       memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
       timestamp: Date.now(),
     }));
@@ -830,6 +1258,77 @@ const server = http.createServer(async (req, res) => {
     const positions = await fetchPositions();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ data: positions }));
+    return;
+  }
+
+  // ─── Token Management Endpoints ──────────────────────────────────────────
+
+  // GET /api/token/status — public token health info
+  if (url.pathname === '/api/token/status' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ data: getTokenHealth() }));
+    return;
+  }
+
+  // POST /api/token/update — manually update access token (admin only)
+  if (url.pathname === '/api/token/update' && req.method === 'POST') {
+    // Verify admin key
+    const adminKey = req.headers['x-admin-key'] || url.searchParams.get('admin_key') || '';
+    if (adminKey !== TOKEN_ADMIN_KEY) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid admin key' }));
+      return;
+    }
+
+    // Rate limit: max 5 token updates per IP per hour
+    if (!checkRateLimit(clientIP, RATE_LIMIT_MAX_TOKEN_UPDATES, 3600000)) {
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Token update rate limit exceeded (max 5/hour)' }));
+      return;
+    }
+
+    try {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const { access_token, refresh_token } = JSON.parse(body || '{}');
+
+      if (!access_token) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'access_token is required' }));
+        return;
+      }
+
+      updateAccessTokenManually(access_token, refresh_token);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        message: 'Token updated. Validation in progress...',
+        tokenHealth: getTokenHealth(),
+      }));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+    }
+    return;
+  }
+
+  // POST /api/token/refresh — force trigger a token refresh (admin only)
+  if (url.pathname === '/api/token/refresh' && req.method === 'POST') {
+    const adminKey = req.headers['x-admin-key'] || url.searchParams.get('admin_key') || '';
+    if (adminKey !== TOKEN_ADMIN_KEY) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid admin key' }));
+      return;
+    }
+
+    const refreshed = await attemptTokenRefresh();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: refreshed,
+      tokenHealth: getTokenHealth(),
+      message: refreshed ? 'Token refreshed successfully' : 'Refresh failed — check logs',
+    }));
     return;
   }
 
@@ -883,6 +1382,7 @@ wss.on('connection', (ws, req) => {
         stocks: state.stocks,
         timestamp: Date.now(),
         source: state.activeSource,
+        dataLabel: tokenState.usingFallback ? 'DELAYED' : 'REAL-TIME',
       },
     }));
   }
@@ -917,6 +1417,7 @@ wss.on('connection', (ws, req) => {
                   stocks: state.stocks,
                   timestamp: Date.now(),
                   source: state.activeSource,
+                  dataLabel: tokenState.usingFallback ? 'DELAYED' : 'REAL-TIME',
                 },
               }));
             }
@@ -925,21 +1426,29 @@ wss.on('connection', (ws, req) => {
             }
           }
 
-          // If options channel, start polling option chain
+          // If options channel — global shared polling at 1s
           if (channel === 'options') {
-            const underlying = params.underlying || 'Nifty 50';
+            const underlying = (params.underlying || 'NIFTY').toUpperCase();
             const expiry = params.expiry || '';
-            // Immediate fetch
-            pollOptionChainForClient(clientId, underlying, expiry);
-            // Then poll every 5 seconds
-            const timer = setInterval(() => {
-              if (state.clients.has(clientId) && client.channels.has('options')) {
-                pollOptionChainForClient(clientId, underlying, expiry);
-              } else {
-                clearInterval(timer);
-              }
-            }, 5000);
-            state.optionChainTimers.set(clientId, timer);
+            const key = ocKey(underlying, expiry);
+
+            if (!state.ocSubscriptions.has(key)) {
+              state.ocSubscriptions.set(key, new Set());
+            }
+            state.ocSubscriptions.get(key).add(clientId);
+
+            // Send cached data immediately if available
+            const cached = state.ocLatestData.get(key);
+            if (cached) {
+              sendToClient(clientId, { type: 'options:update', data: cached });
+            }
+
+            // Start global poll if first subscriber
+            if (state.ocSubscriptions.get(key).size === 1) {
+              startOCPolling(underlying, expiry);
+            }
+
+            console.log(`[OC] ${clientId} subscribed → ${key} (${state.ocSubscriptions.get(key).size} clients)`);
           }
 
           // If positions channel, start polling
@@ -951,7 +1460,7 @@ wss.on('connection', (ws, req) => {
             };
             pollPositions();
             const timer = setInterval(pollPositions, 10000);
-            state.optionChainTimers.set(`positions_${clientId}`, timer);
+            state.positionTimers.set(clientId, timer);
           }
 
           // Send subscribed confirmation
@@ -964,14 +1473,13 @@ wss.on('connection', (ws, req) => {
           client.channels.delete(channel);
           console.log(`[WS] ${clientId} unsubscribed from ${channel}`);
 
-          // Stop option chain polling if applicable
+          // Stop option chain subscription
           if (channel === 'options') {
-            const timer = state.optionChainTimers.get(clientId);
-            if (timer) { clearInterval(timer); state.optionChainTimers.delete(clientId); }
+            removeClientFromAllOC(clientId);
           }
           if (channel === 'positions') {
-            const timer = state.optionChainTimers.get(`positions_${clientId}`);
-            if (timer) { clearInterval(timer); state.optionChainTimers.delete(`positions_${clientId}`); }
+            const timer = state.positionTimers.get(clientId);
+            if (timer) { clearInterval(timer); state.positionTimers.delete(clientId); }
           }
 
           ws.send(JSON.stringify({ type: 'unsubscribed', channel }));
@@ -991,11 +1499,11 @@ wss.on('connection', (ws, req) => {
     console.log(`[WS] Client ${clientId} disconnected: code=${code}`);
     state.clients.delete(clientId);
 
-    // Clean up timers
-    const timer = state.optionChainTimers.get(clientId);
-    if (timer) { clearInterval(timer); state.optionChainTimers.delete(clientId); }
-    const posTimer = state.optionChainTimers.get(`positions_${clientId}`);
-    if (posTimer) { clearInterval(posTimer); state.optionChainTimers.delete(`positions_${clientId}`); }
+    // Clean up option chain subscriptions
+    removeClientFromAllOC(clientId);
+    // Clean up positions timer
+    const posTimer = state.positionTimers.get(clientId);
+    if (posTimer) { clearInterval(posTimer); state.positionTimers.delete(clientId); }
   });
 
   ws.on('error', (err) => {
@@ -1029,11 +1537,13 @@ function startClientPing() {
 
 function start() {
   console.log('═══════════════════════════════════════════════════');
-  console.log('  Pepertect WebSocket Relay Server');
+  console.log('  Pepertect WebSocket Relay Server (Production)');
   console.log('═══════════════════════════════════════════════════');
   console.log(`  PORT: ${PORT}`);
-  console.log(`  Upstox Token: ${UPSTOX_ACCESS_TOKEN ? 'configured' : 'NOT configured'}`);
+  console.log(`  Upstox Token: ${tokenState.accessToken ? 'configured' : 'NOT configured'}`);
+  console.log(`  Refresh Token: ${tokenState.refreshToken ? 'configured' : 'NOT configured'}`);
   console.log(`  Upstox API Key: ${UPSTOX_API_KEY ? 'configured' : 'NOT configured'}`);
+  console.log(`  Admin Key: ${TOKEN_ADMIN_KEY ? 'set' : 'DEFAULT (change in production!)'}`);
   console.log(`  Node.js: ${process.version}`);
   console.log('═══════════════════════════════════════════════════');
 
@@ -1043,7 +1553,7 @@ function start() {
   // Start Yahoo Finance polling (always running as fallback)
   state.yahooPollTimer = setInterval(() => pollYahooFinance(), MARKET_POLL_INTERVAL_MS);
   pollYahooFinance(); // Immediate first poll
-  console.log(`[Yahoo] Started polling every ${MARKET_POLL_INTERVAL_MS}ms`);
+  console.log(`[Yahoo] Started polling every ${MARKET_POLL_INTERVAL_MS}ms (fallback)`);
 
   // Start derived data broadcast
   state.derivedTimer = setInterval(() => broadcastDerivedData(), DERIVED_BROADCAST_INTERVAL_MS);
@@ -1052,16 +1562,27 @@ function start() {
   // Start client ping
   startClientPing();
 
-  // Connect to Upstox WS (if token available)
-  if (UPSTOX_ACCESS_TOKEN) {
-    connectUpstoxWS();
-  }
+  // Token management: validate on startup, then schedule periodic checks
+  validateToken().then(valid => {
+    if (valid) {
+      // Token is valid — connect to Upstox WS
+      connectUpstoxWS();
+    } else {
+      console.log('[Token] Startup: using Yahoo Finance fallback (no valid Upstox token)');
+      tokenState.usingFallback = true;
+    }
+
+    // Start token health check scheduler (runs every 30 min)
+    startTokenCheckScheduler();
+  });
 
   // Start HTTP server
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`\n[Server] Listening on http://0.0.0.0:${PORT}`);
     console.log(`[Server] WebSocket endpoint: ws://0.0.0.0:${PORT}/ws`);
-    console.log(`[Server] Health check: http://0.0.0.0:${PORT}/health\n`);
+    console.log(`[Server] Health check: http://0.0.0.0:${PORT}/health`);
+    console.log(`[Server] Token status: http://0.0.0.0:${PORT}/api/token/status`);
+    console.log(`[Server] Token update: POST http://0.0.0.0:${PORT}/api/token/update\n`);
   });
 }
 
@@ -1071,9 +1592,11 @@ process.on('SIGTERM', () => {
   if (state.yahooPollTimer) clearInterval(state.yahooPollTimer);
   if (state.derivedTimer) clearInterval(state.derivedTimer);
   if (state.clientPingTimer) clearInterval(state.clientPingTimer);
+  if (tokenState.tokenCheckTimer) clearInterval(tokenState.tokenCheckTimer);
   stopUpstoxHeartbeat();
   if (state.upstoxWs) state.upstoxWs.close();
-  for (const timer of state.optionChainTimers.values()) clearInterval(timer);
+  for (const timer of state.ocPollTimers.values()) clearInterval(timer);
+  for (const timer of state.positionTimers.values()) clearInterval(timer);
   wss.close();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000);
@@ -1084,9 +1607,11 @@ process.on('SIGINT', () => {
   if (state.yahooPollTimer) clearInterval(state.yahooPollTimer);
   if (state.derivedTimer) clearInterval(state.derivedTimer);
   if (state.clientPingTimer) clearInterval(state.clientPingTimer);
+  if (tokenState.tokenCheckTimer) clearInterval(tokenState.tokenCheckTimer);
   stopUpstoxHeartbeat();
   if (state.upstoxWs) state.upstoxWs.close();
-  for (const timer of state.optionChainTimers.values()) clearInterval(timer);
+  for (const timer of state.ocPollTimers.values()) clearInterval(timer);
+  for (const timer of state.positionTimers.values()) clearInterval(timer);
   wss.close();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000);
