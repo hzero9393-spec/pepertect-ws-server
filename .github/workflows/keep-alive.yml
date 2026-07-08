@@ -1,0 +1,21 @@
+name: Keep Alive Ping
+
+on:
+  schedule:
+    # Every 5 minutes during Indian market hours (Mon-Fri)
+    # IST 9:00 AM = UTC 3:30 AM, IST 3:30 PM = UTC 10:00 AM
+    - cron: '*/5 3-10 * * 1-5'
+    # Also ping every 10 minutes outside market hours to prevent cold starts
+    - cron: '*/10 * * * *'
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Health Endpoint
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://pepertect-ws.onrender.com/health)
+          echo "Health endpoint returned: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "WARNING: Server returned $STATUS"
+          fi
